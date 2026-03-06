@@ -1,0 +1,22 @@
+version: 1
+applications:
+
+  # ── Backend (Node / Express) ─────────────────────────────────────────────────
+  # NOTE: Amplify Hosting runs the backend as a server-side compute layer.
+  # Make sure you have SSR/compute enabled in Amplify Console for this app.
+  - appRoot: Backend
+    backend:
+      phases:
+        preBuild:
+          commands:
+            - npm ci
+        build:
+          commands:
+            - npm run build      # compiles TypeScript → dist/
+      artifacts:
+        baseDirectory: dist
+        files:
+          - '**/*'
+      cache:
+        paths:
+          - Backend/node_modules/**/*

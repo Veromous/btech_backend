@@ -1,0 +1,25 @@
+node_modules/
+dist/
+.env
+.env.local
+.env.*.local
+
+# Firebase service account — NEVER commit this
+serviceAccountKey.json
+
+# SQLite local database
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
