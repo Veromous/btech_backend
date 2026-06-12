@@ -5,6 +5,7 @@ import authRoutes from './routes/auth';
 import discussionRoutes from './routes/discussions';
 import datasetRoutes from './routes/datasets';
 import catalogRoutes from './routes/catalog';
+import activityRoutes from './routes/activity';
 
 dotenv.config();
 
@@ -24,6 +25,7 @@ app.use('/auth', authRoutes);
 app.use('/discussions', discussionRoutes);
 app.use('/datasets', datasetRoutes);
 app.use('/catalog', catalogRoutes);
+app.use('/activity', activityRoutes);
 
 app.get('/', (_req, res) => {
     res.json({ status: 'DataCenter API running 🚀' });

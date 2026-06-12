@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import Database from 'better-sqlite3';
 import { join } from 'path';
 import * as XLSX from 'xlsx';
+import { scanForPii, describePii } from '../lib/pii';
 
 const router = Router();
 const db = new Database(join(__dirname, '../../datacenter.db'));
@@ -280,6 +281,17 @@ router.post('/', (req: Request, res: Response) => {
             return;
         }
 
+        // ── Privacy gate: never persist personal data to the public catalog ───
+        const pii = scanForPii(data);
+        if (pii.hasPii) {
+            res.status(422).json({
+                error: describePii(pii.findings),
+                piiDetected: true,
+                piiFindings: pii.findings,
+            });
+            return;
+        }
+
         // ── Duplicate check ───────────────────────────────────────────────────
         const existing = db.prepare(
             'SELECT id FROM catalog WHERE LOWER(name) = LOWER(?)'
@@ -315,6 +327,93 @@ router.post('/', (req: Request, res: Response) => {
 
         res.status(201).json({ id: result.lastInsertRowid, name, category, region, rowCount, fileSize });
     } catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Error' });
+    }
+});
+
+// ── GET /catalog/recommended?uid=...&limit=6 ──────────────────────────────────
+// Personalised dataset suggestions derived from the user's recent activity
+// (searches + dataset views) recorded in the user_events table.
+// Must be declared BEFORE the '/:id' route so it isn't swallowed as an id.
+router.get('/recommended', (req: Request, res: Response) => {
+    const uid = ((req.query.uid as string) ?? '').trim();
+    const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 6, 1), 12);
+
+    // No user → no personalisation; the UI falls back to its empty state.
+    if (!uid) { res.json([]); return; }
+
+    try {
+        // Pull the user's recent events (last 60 days, most recent 60).
+        const cutoff = Math.floor(Date.now() / 1000) - 60 * 24 * 3600;
+        let events: any[] = [];
+        try {
+            events = db.prepare(`
+                SELECT kind, term, category, datasetId, createdAt FROM user_events
+                WHERE uid = ? AND createdAt >= ?
+                ORDER BY createdAt DESC LIMIT 60
+            `).all(uid, cutoff);
+        } catch {
+            // user_events table may not exist yet — no activity to work with
+            events = [];
+        }
+
+        if (events.length === 0) { res.json([]); return; }
+
+        // ── Build a recency-weighted interest profile ─────────────────────────
+        const now = Math.floor(Date.now() / 1000);
+        const categoryScore: Record<string, number> = {};
+        const tokenScore: Record<string, number> = {};
+        const viewedIds = new Set<number>();
+
+        for (const e of events) {
+            const ageDays = (now - e.createdAt) / 86400;
+            const recency = Math.max(0.2, 1 - ageDays / 60);   // newer events count more
+            const kindWeight = e.kind === 'view' ? 2 : 1;       // a view signals more intent than a search
+            const w = recency * kindWeight;
+
+            if (e.category) categoryScore[e.category] = (categoryScore[e.category] ?? 0) + w;
+            if (e.kind === 'view' && typeof e.datasetId === 'number') viewedIds.add(e.datasetId);
+
+            if (e.term) {
+                for (const tok of String(e.term).toLowerCase().split(/[^a-z0-9]+/)) {
+                    if (tok.length > 2) tokenScore[tok] = (tokenScore[tok] ?? 0) + w;
+                }
+            }
+        }
+
+        // ── Score every dataset against the profile ───────────────────────────
+        const datasets: any[] = db.prepare(`
+            SELECT id, name, description, category, region, source, year, rowCount, fileSize
+            FROM catalog
+        `).all();
+
+        const scored = datasets.map((d) => {
+            let score = 0;
+            if (categoryScore[d.category]) score += categoryScore[d.category] * 3;
+
+            const hay = `${d.name} ${d.description} ${d.region} ${d.category}`.toLowerCase();
+            for (const tok in tokenScore) {
+                if (hay.includes(tok)) score += tokenScore[tok] * 2;
+            }
+            return { d, score };
+        });
+
+        // Prefer relevant datasets the user hasn't already opened (discovery).
+        let recs = scored
+            .filter((s) => s.score > 0 && !viewedIds.has(s.d.id))
+            .sort((a, b) => b.score - a.score);
+
+        // Backfill with relevant already-viewed ones if we're short.
+        if (recs.length < limit) {
+            const seen = scored
+                .filter((s) => s.score > 0 && viewedIds.has(s.d.id))
+                .sort((a, b) => b.score - a.score);
+            recs = recs.concat(seen);
+        }
+
+        res.json(recs.slice(0, limit).map((s) => s.d));
+    } catch (err) {
+        console.error('GET /catalog/recommended error:', err);
         res.status(500).json({ error: err instanceof Error ? err.message : 'Error' });
     }
 });

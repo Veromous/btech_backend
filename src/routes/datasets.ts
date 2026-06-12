@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import getRawBody from 'raw-body';
+import { scanForPii, describePii } from '../lib/pii';
 
 const router = Router();
 
@@ -487,6 +488,17 @@ router.post('/upload', async (req: Request, res: Response) => {
     } catch (err) {
         console.error('Parse error:', err);
         res.status(422).json({ error: 'Failed to parse file: ' + (err as Error).message });
+        return;
+    }
+
+    // ── Privacy gate: reject files carrying personal data ────────────────────
+    const pii = scanForPii(rows);
+    if (pii.hasPii) {
+        res.status(422).json({
+            error: describePii(pii.findings),
+            piiDetected: true,
+            piiFindings: pii.findings,
+        });
         return;
     }
 
