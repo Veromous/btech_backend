@@ -1,13 +1,15 @@
+// Load environment variables FIRST — before any route module is imported, so
+// that modules reading process.env at load time (e.g. auth.ts builds its SMTP
+// transporter from SMTP_USER/SMTP_PASS) see the populated values.
+import 'dotenv/config';
+
 import express from 'express';
 import cors from 'cors';
-import dotenv from 'dotenv';
 import authRoutes from './routes/auth';
 import discussionRoutes from './routes/discussions';
 import datasetRoutes from './routes/datasets';
 import catalogRoutes from './routes/catalog';
 import activityRoutes from './routes/activity';
-
-dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT ?? 4000;
@@ -28,7 +30,7 @@ app.use('/catalog', catalogRoutes);
 app.use('/activity', activityRoutes);
 
 app.get('/', (_req, res) => {
-    res.json({ status: 'DataCenter API running 🚀' });
+    res.json({ status: 'DataCenter API running' });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────

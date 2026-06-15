@@ -26,7 +26,6 @@ export type PiiType =
     | 'Passport number'
     | 'Credit/debit card number'
     | 'Bank account / IBAN'
-    | 'Date of birth'
     | 'Physical address'
     | 'Government ID number';
 
@@ -86,7 +85,6 @@ const HEADER_RULES: { keywords: string[]; type: PiiType }[] = [
     { type: 'Passport number', keywords: ['passport', 'passportno', 'passportnumber'] },
     { type: 'Credit/debit card number', keywords: ['creditcard', 'debitcard', 'cardnumber', 'cardno', 'ccnumber', 'pan'] },
     { type: 'Bank account / IBAN', keywords: ['iban', 'bankaccount', 'accountnumber', 'accountno', 'rib', 'swift', 'bic'] },
-    { type: 'Date of birth', keywords: ['dateofbirth', 'dob', 'birthdate', 'datenaissance', 'naissance'] },
     {
         type: 'Physical address',
         keywords: ['homeaddress', 'streetaddress', 'residentialaddress', 'mailingaddress', 'postaladdress', 'adresse'],
@@ -107,11 +105,15 @@ const ID_HINT_KEYWORDS = [
 // ─── Value patterns ─────────────────────────────────────────────────────────────
 // Distinctive: safe to flag on values alone.
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[a-z]{2,}$/i;
-// Phone: must look like a real phone — country code, leading 00, or grouped
-// separators — so bare integers (4200, 2023) are not mistaken for phone numbers.
-const PHONE_RE = /^(?:\+|00)\d[\d\s().-]{6,}\d$|^\(?\d{2,4}\)?[\s.-]\d{2,4}[\s.-]\d{2,4}(?:[\s.-]\d{2,4})?$/;
-// Cameroon mobile: +237 6/2 XXXXXXXX (also accepts the local 9-digit form).
-const PHONE_CM_RE = /^(?:\+?237)?\s?[62]\d{7,8}$/;
+// International phone: must carry a leading "+" or "00" country code, so plain
+// dates (2023-01-15) and bare integers (4200, 2023) are never mistaken for one.
+const PHONE_RE = /^(?:\+|00)\d[\d\s().-]{6,}\d$/;
+// Cameroon phone number: 9 local digits starting with 6 (mobile) or 2 (fixed),
+// optionally preceded by the country code 237 or +237. Both the bare 9-digit
+// form and the country-code form are treated as phone numbers and blocked.
+// Separators (space/dot/dash) inside the number are tolerated; a date such as
+// 2023-01-15 (only 8 digits) cannot satisfy the 9-digit requirement.
+const PHONE_CM_RE = /^(?:\+?237[\s.-]?)?[62](?:[\s.-]?\d){8}$/;
 const SSN_RE = /^\d{3}-\d{2}-\d{4}$/;
 const IBAN_RE = /^[A-Z]{2}\d{2}[A-Z0-9]{10,30}$/i;
 // 13–19 digit card-like sequences, optionally grouped — Luhn-checked below.

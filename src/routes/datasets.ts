@@ -276,6 +276,20 @@ function parseXlsx(buf: Buffer): Row[] {
 }
 
 // ─── Dataset cleaner (follows pseudocode exactly) ─────────────────────────────
+
+/**
+ * One of the six qualities of a good dataset. `score` is 0–100; `score === -1`
+ * means the quality could not be assessed for this dataset (e.g. "Balanced"
+ * when there are no categorical columns).
+ */
+interface QualityDimension {
+    key: 'accurate' | 'complete' | 'relevant' | 'consistent' | 'representative' | 'balanced';
+    label: string;
+    score: number;
+    status: 'good' | 'fair' | 'poor' | 'na';
+    detail: string;
+}
+
 interface AnalysisResult {
     qualityScore: number;
     qualityLevel: string;
@@ -283,6 +297,7 @@ interface AnalysisResult {
     rowCount: number;
     columnCount: number;
     cleanedPreview: (string | number | null)[][];
+    dimensions: QualityDimension[];
 }
 
 function isNumericValue(v: unknown): boolean {
@@ -290,9 +305,195 @@ function isNumericValue(v: unknown): boolean {
     return !isNaN(Number(v));
 }
 
+const clampScore = (x: number): number => Math.max(0, Math.min(100, Math.round(x)));
+
+const statusOf = (score: number): QualityDimension['status'] =>
+    score < 0 ? 'na' : score >= 75 ? 'good' : score >= 50 ? 'fair' : 'poor';
+
+/**
+ * Assess the six qualities of a good dataset directly from the parsed rows.
+ * Each dimension is scored 0–100 with a short human-readable explanation, so
+ * the report can show *why* a dataset is or isn't fit for use — not just nulls.
+ */
+function assessQualities(
+    rows: Row[],
+    allKeys: string[],
+    numericKeys: string[],
+    missingPct: number,
+): QualityDimension[] {
+    const n = rows.length;
+    const colValues = (key: string) =>
+        rows
+            .map((r) => r[key])
+            .filter((v) => v !== null && v !== undefined && v !== '');
+
+    // ── Complete: how few cells are missing. ──────────────────────────────────
+    const completeScore = clampScore(100 - missingPct);
+
+    // ── Accurate: do values match the column's dominant type? ─────────────────
+    // A column that mixes numbers and text (e.g. "12", "N/A", "abc") signals
+    // data-entry errors, so we score each column by its type purity.
+    let purSum = 0;
+    let purCnt = 0;
+    for (const key of allKeys) {
+        const vals = colValues(key);
+        if (vals.length === 0) continue;
+        const numeric = vals.filter(isNumericValue).length;
+        const purity = Math.max(numeric, vals.length - numeric) / vals.length;
+        purSum += purity;
+        purCnt++;
+    }
+    const accurateScore = purCnt > 0 ? clampScore((purSum / purCnt) * 100) : 0;
+
+    // ── Consistent: are text values formatted uniformly? ─────────────────────
+    // Values that match after trimming + lower-casing but differ as written
+    // ("Yaoundé" vs "yaounde ") are inconsistent formatting.
+    let consSum = 0;
+    let consCnt = 0;
+    for (const key of allKeys) {
+        if (numericKeys.includes(key)) continue;
+        const vals = colValues(key).map(String);
+        if (vals.length === 0) continue;
+        const groups = new Map<string, Set<string>>();
+        for (const v of vals) {
+            const norm = v.trim().toLowerCase();
+            if (!groups.has(norm)) groups.set(norm, new Set());
+            groups.get(norm)!.add(v);
+        }
+        let inconsistent = 0;
+        for (const set of groups.values()) if (set.size > 1) inconsistent += set.size;
+        consSum += 1 - inconsistent / vals.length;
+        consCnt++;
+    }
+    const consistentScore = consCnt > 0 ? clampScore((consSum / consCnt) * 100) : 100;
+
+    // ── Relevant: how many columns actually carry information? ────────────────
+    // All-null or single-value (constant) columns add nothing to the analysis.
+    let informative = 0;
+    for (const key of allKeys) {
+        const vals = colValues(key);
+        const distinct = new Set(vals.map(String)).size;
+        if (vals.length > 0 && distinct > 1) informative++;
+    }
+    const relevantScore = allKeys.length > 0 ? clampScore((informative / allKeys.length) * 100) : 0;
+
+    // ── Representative: enough distinct rows to stand in for the population. ──
+    // Penalise duplicate rows and very small samples.
+    const rowKey = (r: Row) => allKeys.map((k) => String(r[k] ?? '')).join('');
+    const seen = new Set<string>();
+    let dup = 0;
+    for (const r of rows) {
+        const k = rowKey(r);
+        if (seen.has(k)) dup++;
+        else seen.add(k);
+    }
+    const uniqueness = n > 0 ? 1 - dup / n : 0;
+    const sizeAdequacy = Math.min(1, n / 50); // 50+ rows treated as adequate
+    const representativeScore = clampScore((uniqueness * 0.6 + sizeAdequacy * 0.4) * 100);
+
+    // ── Balanced: are categorical classes evenly represented? ────────────────
+    // Measured with normalised Shannon entropy over each low-cardinality text
+    // column (2–20 distinct values). N/A when there are no such columns.
+    const catScores: number[] = [];
+    for (const key of allKeys) {
+        if (numericKeys.includes(key)) continue;
+        const vals = colValues(key).map(String);
+        if (vals.length === 0) continue;
+        const counts = new Map<string, number>();
+        for (const v of vals) counts.set(v, (counts.get(v) ?? 0) + 1);
+        const k = counts.size;
+        if (k < 2 || k > 20) continue;
+        let H = 0;
+        for (const c of counts.values()) {
+            const p = c / vals.length;
+            H -= p * Math.log(p);
+        }
+        catScores.push(H / Math.log(k)); // 1 = perfectly even, 0 = one class dominates
+    }
+    const balancedScore =
+        catScores.length > 0
+            ? clampScore((catScores.reduce((a, b) => a + b, 0) / catScores.length) * 100)
+            : -1;
+
+    const detail = (score: number, good: string, bad: string, na?: string) =>
+        score < 0 ? (na ?? 'Not applicable to this dataset.') : score >= 75 ? good : bad;
+
+    return [
+        {
+            key: 'accurate',
+            label: 'Accurate',
+            score: accurateScore,
+            status: statusOf(accurateScore),
+            detail: detail(
+                accurateScore,
+                'Values conform to each column\'s expected data type.',
+                'Some columns mix data types (e.g. numbers with text), suggesting entry errors.',
+            ),
+        },
+        {
+            key: 'complete',
+            label: 'Complete',
+            score: completeScore,
+            status: statusOf(completeScore),
+            detail: detail(
+                completeScore,
+                'Few or no missing values across the dataset.',
+                `About ${Math.round(missingPct)}% of cells are missing.`,
+            ),
+        },
+        {
+            key: 'relevant',
+            label: 'Relevant',
+            score: relevantScore,
+            status: statusOf(relevantScore),
+            detail: detail(
+                relevantScore,
+                'Every column carries useful, varying information.',
+                'Some columns are empty or hold a single repeated value, adding little insight.',
+            ),
+        },
+        {
+            key: 'consistent',
+            label: 'Consistent',
+            score: consistentScore,
+            status: statusOf(consistentScore),
+            detail: detail(
+                consistentScore,
+                'Text values are formatted uniformly.',
+                'Some values differ only in casing or spacing (e.g. "Yes" vs "yes ").',
+            ),
+        },
+        {
+            key: 'representative',
+            label: 'Representative',
+            score: representativeScore,
+            status: statusOf(representativeScore),
+            detail: detail(
+                representativeScore,
+                'Enough distinct rows to represent the population.',
+                n < 50
+                    ? `Only ${n} row${n === 1 ? '' : 's'} — a larger sample would be more representative.`
+                    : 'Many duplicate rows reduce how well the data represents the population.',
+            ),
+        },
+        {
+            key: 'balanced',
+            label: 'Balanced',
+            score: balancedScore,
+            status: statusOf(balancedScore),
+            detail: detail(
+                balancedScore,
+                'Categorical groups are fairly evenly represented.',
+                'One or more categories dominate, leaving the data imbalanced.',
+                'No categorical columns to assess for balance.',
+            ),
+        },
+    ];
+}
+
 function cleanAndAnalyze(rows: Row[]): AnalysisResult {
     const warnings: string[] = [];
-    let qualityScore = 100;
+    let qualityScore: number;
 
     if (rows.length === 0) {
         return {
@@ -302,6 +503,7 @@ function cleanAndAnalyze(rows: Row[]): AnalysisResult {
             rowCount: 0,
             columnCount: 0,
             cleanedPreview: [],
+            dimensions: [],
         };
     }
 
@@ -319,7 +521,6 @@ function cleanAndAnalyze(rows: Row[]): AnalysisResult {
 
     if (missingPct > 30) {
         warnings.push('High number of missing values detected');
-        qualityScore -= 25;
     }
 
     // ── STEP 2: Select Numerical Columns ─────────────────────────────────────
@@ -333,7 +534,6 @@ function cleanAndAnalyze(rows: Row[]): AnalysisResult {
     const numericRatio = allKeys.length > 0 ? numericKeys.length / allKeys.length : 0;
     if (numericRatio < 0.3) {
         warnings.push('Dataset contains insufficient numerical data');
-        qualityScore -= 20;
     }
 
     // ── STEP 3: Mean Imputation ───────────────────────────────────────────────
@@ -375,7 +575,6 @@ function cleanAndAnalyze(rows: Row[]): AnalysisResult {
         warnings.push(
             `Columns removed due to complete missing values: ${unusableColumns.join(', ')}`
         );
-        qualityScore -= 20;
     }
 
     // ── STEP 4: Post-Imputation Validation ───────────────────────────────────
@@ -390,11 +589,24 @@ function cleanAndAnalyze(rows: Row[]): AnalysisResult {
     }
     if (remainingMissing > 0) {
         warnings.push('Unresolved missing values remain after imputation');
-        qualityScore -= 10;
     }
 
     // ── STEP 5: Quality Classification ───────────────────────────────────────
-    qualityScore = Math.max(0, qualityScore);
+    // Assess the six qualities of a good dataset and surface them in the report.
+    const dimensions = assessQualities(rows, allKeys, numericKeys, missingPct);
+
+    // Warn about any quality that scores poorly so it shows up in the warnings list.
+    for (const d of dimensions) {
+        if (d.status === 'poor') warnings.push(`${d.label}: ${d.detail}`);
+    }
+
+    // Overall score is the average of the assessable qualities (ignoring N/A),
+    // so the report reflects all six dimensions — not just missing values.
+    const scored = dimensions.filter((d) => d.score >= 0);
+    qualityScore = scored.length
+        ? clampScore(scored.reduce((a, d) => a + d.score, 0) / scored.length)
+        : 0;
+
     let qualityLevel: string;
     if (qualityScore < 50) qualityLevel = 'Low Quality';
     else if (qualityScore < 75) qualityLevel = 'Medium Quality';
@@ -420,6 +632,7 @@ function cleanAndAnalyze(rows: Row[]): AnalysisResult {
         rowCount: cleanedRows.length,
         columnCount: finalKeys.length,
         cleanedPreview: preview,
+        dimensions,
     };
 }
 
